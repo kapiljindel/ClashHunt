@@ -3,59 +3,92 @@ import discord
 from discord.ext import tasks, commands
 from discord import app_commands
 import aiohttp
-import json
 import os
-from datetime import datetime, timezone
 import urllib.parse
+from datetime import datetime, timezone
+from dotenv import load_dotenv
 
-# Import our secondary utility module
+# Import the asynchronous MongoDB driver
+from motor.motor_asyncio import AsyncIOMotorClient
+
+# Import our secondary scraper utility module
 from scraper import scrape_fwa_details
 
-# ==================== CONFIGURATION ====================
-DISCORD_BOT_TOKEN = "MTUxMDQ3MjY0MjYzNjAyMTg1MQ.G5iTuJ.99O-Q6b6wZCrIA-znT604O31ihTiLoHd7VujmU"
-COC_API_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiIsImtpZCI6IjI4YTMxOGY3LTAwMDAtYTFlYi03ZmExLTJjNzQzM2M2Y2NhNSJ9.eyJpc3MiOiJzdXBlcmNlbGwiLCJhdWQiOiJzdXBlcmNlbGw6Z2FtZWFwaSIsImp0aSI6Ijg4ZDQzM2I5LWZlMTQtNGQwYS05NjE2LTczZTlkMDYxZmVkNCIsImlhdCI6MTc4MTg3NjkxOSwic3ViIjoiZGV2ZWxvcGVyL2M4ZmEzOGQxLWRiNDMtM2M4Yi05MjljLWI0YWJlMWE3NzlhNCIsInNjb3BlcyI6WyJjbGFzaCJdLCJsaW1pdHMiOlt7InRpZXIiOiJkZXZlbG9wZXIvc2lsdmVyIiwidHlwZSI6InRocm90dGxpbmcifSx7ImNpZHJzIjpbIjExNC4xMzQuMjQuMjAwIl0sInR5cGUiOiJjbGllbnQifV19.ULTc6TxD7yI3K_y4ODch8xx2VlMtSm86gBW_blqPTliZqywAPJ6n6z4l6YeW9Ti2F15bT3GNG9Vn3UGrczVaCQ"
-CLANS_FILE = "clans.json"
-# =======================================================
+# Load credentials from .env
+load_dotenv()
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+COC_API_TOKEN = os.getenv("COC_API_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
 
 intents = discord.Intents.default()
 intents.message_content = True  
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Cache dictionary to track multiple wars simultaneously
+# MongoDB Global Database Client References
+mongo_client = None
+db = None
+clans_collection = None
+
+# Multi-server anti-spam loop cache -> {"guild_id-clan_tag": "opponentTag-state"}
 active_wars = {}
 
-# --- DATABASE HELPER FUNCTIONS ---
-def load_clans():
-    """Loads tracked clans from the local JSON file."""
-    if not os.path.exists(CLANS_FILE):
-        return {}
-    try:
-        with open(CLANS_FILE, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return {}
+# --- DATABASE MANAGEMENT FUNCTIONS ---
+def init_mongodb():
+    """Initializes the MongoDB connection client."""
+    global mongo_client, db, clans_collection
+    if not MONGO_URI:
+        print("[Critical Error] MONGO_URI is missing from your .env file!")
+        return False
+    
+    mongo_client = AsyncIOMotorClient(MONGO_URI)
+    db = mongo_client["fwa_war_bot"]
+    clans_collection = db["tracked_clans"]
+    print("[Database] Successfully connected to MongoDB Cluster.")
+    return True
 
-def save_clans(data):
-    """Saves tracked clans to the local JSON file."""
-    try:
-        with open(CLANS_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
-    except Exception as e:
-        print(f"[Storage Error] Could not save clans layout: {e}")
+async def db_add_clan(tag, name, channel_id, guild_id):
+    """Saves or updates a clan tracking record scoped to a specific guild server."""
+    await clans_collection.update_one(
+        {"clan_tag": tag, "guild_id": guild_id},
+        {"$set": {"clan_name": name, "channel_id": channel_id}},
+        upsert=True
+    )
 
-# --- AUTOCOMPLETE DROPDOWN FILTER ---
+async def db_remove_clan(tag, guild_id):
+    """Deletes a clan tracking record scoped to a specific guild server."""
+    await clans_collection.delete_one({"clan_tag": tag, "guild_id": guild_id})
+
+async def db_get_guild_clans(guild_id):
+    """Fetches all tracked clans for a specific server guild only."""
+    cursor = clans_collection.find({"guild_id": guild_id})
+    clans = await cursor.to_list(length=100)
+    
+    clans_data = {}
+    for c in clans:
+        clans_data[c["clan_tag"]] = {"clan_name": c["clan_name"], "channel_id": c["channel_id"]}
+    return clans_data
+
+async def db_get_all_global_clans():
+    """Fetches every single tracked entry across all servers for the background loop."""
+    cursor = clans_collection.find({})
+    return await cursor.to_list(length=1000)
+
+
+# --- AUTOCOMPLETE DROPDOWN FILTER (SERVER SCOPED) ---
 async def clan_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    """Generates a dynamic dropdown menu of registered clans inside Discord."""
-    clans_data = load_clans()
+    """Generates dropdown options showing ONLY clans registered in the current server."""
+    if not interaction.guild_id:
+        return []
+        
+    guild_clans = await db_get_guild_clans(interaction.guild_id)
     choices = []
     
-    for tag, details in clans_data.items():
+    for tag, details in guild_clans.items():
         display_name = f"{details['clan_name']} ({tag})"
-        # Filter choices based on what the user is typing, or show all if empty
         if current.lower() in display_name.lower():
             choices.append(app_commands.Choice(name=display_name, value=tag))
             
-    return choices[:25]  # Discord maximum application option limit is 25 items
+    return choices[:25]
 
 
 # --- COC DATA PARSERS ---
@@ -81,14 +114,11 @@ def get_th_composition(members):
     return " ".join(comp_strings) if comp_strings else "No data"
 
 async def generate_war_embed(clan_tag):
-    """Fetches API & Scraper data for any given clan tag and builds the embed payload."""
+    """Queries CoC API and running scraper pipelines to compile an output layout."""
     clean_tag = clan_tag.upper().replace("#", "").strip()
     encoded_tag = urllib.parse.quote(f"#{clean_tag}")
     url = f"https://api.clashofclans.com/v1/clans/{encoded_tag}/currentwar"
-    headers = {
-        "Authorization": f"Bearer {COC_API_TOKEN}",
-        "Accept": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {COC_API_TOKEN}", "Accept": "application/json"}
 
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as response:
@@ -122,11 +152,7 @@ async def generate_war_embed(clan_tag):
     clean_our_tag = clan.get('tag', '').replace('#', '')
     clean_enemy_tag = opponent.get('tag', '').replace('#', '')
 
-    embed = discord.Embed(
-        description="<@&1500908965196730480>", 
-        color=3368601                          
-    )
-    
+    embed = discord.Embed(description="<@&1500908965196730480>", color=3368601)
     badge_url = clan.get('badgeUrls', {}).get('medium', "https://api-assets.clashofclans.com/badges/200/GZm0ep4Lp9-5woM7I6P2DD61PIzuMuT2Jk3EeZbpKVc.png")
     embed.set_thumbnail(url=badge_url)
 
@@ -148,72 +174,61 @@ async def generate_war_embed(clan_tag):
     return embed, match_id, None
 
 
-# --- MULTI-CLAN BACKGROUND LOOP ---
+# --- SERVER-AWARE BACKGROUND TASK LOOP ---
 @tasks.loop(minutes=15)
 async def check_clan_war_loop():
     await bot.wait_until_ready()
-    clans_data = load_clans()
-    if not clans_data: return
+    all_tracked_entries = await db_get_all_global_clans()
+    if not all_tracked_entries: return
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Automated loop verifying {len(clans_data)} registered clans...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Loop handling {len(all_tracked_entries)} total database tracks...")
 
-    for tag, config in clans_data.items():
-        channel_id = config.get("channel_id")
+    for document in all_tracked_entries:
+        tag = document["clan_tag"]
+        guild_id = document["guild_id"]
+        channel_id = document["channel_id"]
+        
         channel = bot.get_channel(channel_id)
         if not channel: continue
+
+        # Scoping key unique per server + per clan tag
+        cache_key = f"{guild_id}-{tag}"
 
         try:
             embed, match_id, error = await generate_war_embed(tag)
             if error or match_id == "notInWar":
-                active_wars[tag] = None
+                active_wars[cache_key] = None
                 continue
 
-            if active_wars.get(tag) == match_id:
+            if active_wars.get(cache_key) == match_id:
                 continue
 
             await channel.send(embed=embed)
-            print(f"[Loop Success] Sent live war logging update for clan: {tag}")
-            active_wars[tag] = match_id
+            print(f"[Loop Success] Update posted for {tag} on Guild: {guild_id}")
+            active_wars[cache_key] = match_id
 
         except Exception as e:
-            print(f"[Loop Exception] Failed processing metrics for {tag}: {e}")
+            print(f"[Loop Exception] Tracking error on {tag} for guild {guild_id}: {e}")
         
         await asyncio.sleep(2)
 
 
-# --- DROPDOWN POWERED SLASH COMMANDS ---
+# --- APPLICATION TREE SLASH COMMANDS ---
 
-@bot.tree.command(name="checkwar", description="Instantly check live status for any tracked clan.")
-@app_commands.autocomplete(clan_tag=clan_autocomplete)
-@app_commands.describe(clan_tag="Choose a clan from your tracking dashboard list.")
-async def checkwar_command(interaction: discord.Interaction, clan_tag: str):
-    """Allows manual check on a specific tag chosen from the dynamic dropdown selection."""
-    await interaction.response.defer(thinking=True)
-    
-    try:
-        embed, _, error = await generate_war_embed(clan_tag)
-        if error:
-            await interaction.followup.send(f"❌ Error fetching layout profiles: `{error}`")
-            return
-        if _ == "notInWar":
-            await interaction.followup.send(f"🛡️ The clan `{clan_tag.upper()}` is currently not engaged in an active war.")
-            return
-
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send("❌ Critical system failure during manual trace processing pipelines.")
-        print(f"[Command Exception] {e}")
-
-
-@bot.tree.command(name="addclan", description="Register a new clan to be tracked automatically in this channel.")
-@app_commands.describe(clan_tag="The unique in-game tag of your clan (e.g., #2LRGQ2L9L)")
+@bot.tree.command(name="addclan", description="Register a new clan to be tracked automatically in this server channel.")
+@app_commands.describe(clan_tag="The unique in-game tag of your clan (e.g., #2RLGQ2L9L)")
 async def addclan(interaction: discord.Interaction, clan_tag: str):
+    if not interaction.guild_id:
+        await interaction.response.send_message("❌ This command must be executed within a server guild.", ephemeral=True)
+        return
+
     await interaction.response.defer(ephemeral=True)
     formatted_tag = f"#{clan_tag.upper().replace('#', '').strip()}"
     
-    clans_data = load_clans()
-    if formatted_tag in clans_data:
-        await interaction.followup.send(f"⚠️ `{formatted_tag}` is already being tracked in <#{clans_data[formatted_tag]['channel_id']}>.")
+    # Check if this server already tracks this specific tag
+    guild_clans = await db_get_guild_clans(interaction.guild_id)
+    if formatted_tag in guild_clans:
+        await interaction.followup.send(f"⚠️ `{formatted_tag}` is already tracked in <#{guild_clans[formatted_tag]['channel_id']}> on this server.")
         return
 
     encoded_tag = urllib.parse.quote(formatted_tag)
@@ -223,47 +238,50 @@ async def addclan(interaction: discord.Interaction, clan_tag: str):
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as response:
             if response.status != 200:
-                await interaction.followup.send("❌ Could not register clan. Please verify that the tag is valid.")
+                await interaction.followup.send("❌ Registration rejected. Please check the clan tag.")
                 return
             data = await response.json()
             clan_name = data.get("name", "Unknown Clan")
 
-    clans_data[formatted_tag] = {
-        "clan_name": clan_name,
-        "channel_id": interaction.channel_id
-    }
-    save_clans(clans_data)
-    await interaction.followup.send(f"✅ Success! **{clan_name}** (`{formatted_tag}`) is now being tracked in this channel.")
+    # Save to MongoDB with server boundary validation
+    await db_add_clan(formatted_tag, clan_name, interaction.channel_id, interaction.guild_id)
+    await interaction.followup.send(f"✅ MongoDB Entry Saved! **{clan_name}** (`{formatted_tag}`) is now tracked for this server.")
 
 
-@bot.tree.command(name="removeclan", description="Stop auto-tracking a specific clan tag.")
+@bot.tree.command(name="removeclan", description="Stop auto-tracking a specific clan tag in this server.")
 @app_commands.autocomplete(clan_tag=clan_autocomplete)
-@app_commands.describe(clan_tag="Choose which clan to remove from tracking.")
+@app_commands.describe(clan_tag="Choose which clan to clear from this server's records.")
 async def removeclan(interaction: discord.Interaction, clan_tag: str):
-    clans_data = load_clans()
+    if not interaction.guild_id: return
+    
+    guild_clans = await db_get_guild_clans(interaction.guild_id)
     formatted_tag = clan_tag.upper().strip()
 
-    if formatted_tag not in clans_data:
-        await interaction.response.send_message(f"❌ `{formatted_tag}` is not currently being tracked.", ephemeral=True)
+    if formatted_tag not in guild_clans:
+        await interaction.response.send_message("❌ That clan is not tracked on this server layout.", ephemeral=True)
         return
 
-    name = clans_data[formatted_tag]["clan_name"]
-    del clans_data[formatted_tag]
-    if formatted_tag in active_wars: del active_wars[formatted_tag]
-    save_clans(clans_data)
+    name = guild_clans[formatted_tag]["clan_name"]
+    
+    # Delete from MongoDB matching this specific server only
+    await db_remove_clan(formatted_tag, interaction.guild_id)
+    cache_key = f"{interaction.guild_id}-{formatted_tag}"
+    if cache_key in active_wars: del active_wars[cache_key]
 
-    await interaction.response.send_message(f"🗑️ Stopped tracking **{name}** (`{formatted_tag}`).", ephemeral=True)
+    await interaction.response.send_message(f"🗑️ Wiped server logging records for **{name}** (`{formatted_tag}`).", ephemeral=True)
 
 
-@bot.tree.command(name="listclans", description="Show all clans currently tracked by the bot system.")
+@bot.tree.command(name="listclans", description="Show clans currently tracked inside this server.")
 async def listclans(interaction: discord.Interaction):
-    clans_data = load_clans()
-    if not clans_data:
-        await interaction.response.send_message("📭 No clans are currently configured for tracking.", ephemeral=True)
+    if not interaction.guild_id: return
+    
+    guild_clans = await db_get_guild_clans(interaction.guild_id)
+    if not guild_clans:
+        await interaction.response.send_message("📭 No clans are configured for tracking in this server.", ephemeral=True)
         return
 
-    embed = discord.Embed(title="📋 Tracked Clans Overview", color=0x336869)
-    for tag, details in clans_data.items():
+    embed = discord.Embed(title="📋 Server Tracked Clans Overview", color=0x336869)
+    for tag, details in guild_clans.items():
         embed.add_field(
             name=f"{details['clan_name']} ({tag})",
             value=f"Logging destination: <#{details['channel_id']}>",
@@ -272,9 +290,35 @@ async def listclans(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-# --- INITIALIZATION ---
+@bot.tree.command(name="checkwar", description="Instantly check live status for any server-tracked clan.")
+@app_commands.autocomplete(clan_tag=clan_autocomplete)
+@app_commands.describe(clan_tag="Select a clan from your server's registered dashboard list.")
+async def checkwar_command(interaction: discord.Interaction, clan_tag: str):
+    await interaction.response.defer(thinking=True)
+    try:
+        embed, _, error = await generate_war_embed(clan_tag)
+        if error:
+            await interaction.followup.send(f"❌ Error compiling log layout: `{error}`")
+            return
+        if _ == "notInWar":
+            await interaction.followup.send(f"🛡️ The clan `{clan_tag.upper()}` is not in an active war.")
+            return
+
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send("❌ Internal database or parsing pipeline crash.")
+        print(f"[Command Exception] {e}")
+
+
+# --- BOT EVENT HANDLERS ---
 @bot.event
 async def on_ready():
+    # Setup our asynchronous MongoDB cluster endpoints
+    if not init_mongodb():
+        print("[Shutdown] Terminating execution: MongoDB initialization failed.")
+        await bot.close()
+        return
+        
     print(f"Logged into Discord API as: {bot.user.name}")
     print("Syncing slash commands with Discord global trees...")
     try:
@@ -288,4 +332,7 @@ async def on_ready():
         check_clan_war_loop.start()
 
 if __name__ == "__main__":
-    bot.run(DISCORD_BOT_TOKEN)
+    if not DISCORD_BOT_TOKEN or not COC_API_TOKEN:
+        print("[Critical Error] Tokens are missing! Check your local .env configuration script.")
+    else:
+        bot.run(DISCORD_BOT_TOKEN)
