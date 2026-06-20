@@ -1,6 +1,5 @@
 # Files
-.env
-
+./.env
 #Folders
 __pycache__/
 /.venv/

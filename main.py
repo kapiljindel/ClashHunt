@@ -1,15 +1,15 @@
 import asyncio
-import discord
-from discord.ext import tasks, commands
-from discord import app_commands
-import aiohttp
+import discord  # type: ignore
+from discord.ext import tasks, commands  # type: ignore
+from discord import app_commands  # type: ignore
+import aiohttp # type: ignore
 import os
 import urllib.parse
 from datetime import datetime, timezone
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # type: ignore
 
 # Import the asynchronous MongoDB driver
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient  # type: ignore
 
 # Import our secondary scraper utility module
 from scraper import scrape_fwa_details
