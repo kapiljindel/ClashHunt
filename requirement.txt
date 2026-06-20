@@ -1,0 +1,7 @@
+## 1st Req
+pip install discord.py aiohttp
+
+
+## 2nd Req
+pip install playwright
+playwright install
